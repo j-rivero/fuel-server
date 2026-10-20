@@ -1,8 +1,11 @@
 package vcs
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -40,10 +43,23 @@ func randomBytes(t *testing.T, size int) []byte {
 	return bs
 }
 
+// forLooseAndPacked runs check on repo with its objects loose, as they are
+// written, and then packed.
+func forLooseAndPacked(t *testing.T, repo *GoGitVCS, check func(t *testing.T, repo *GoGitVCS)) {
+	t.Run("loose objects", func(t *testing.T) { check(t, repo) })
+
+	out, err := exec.Command("git", "-C", repo.Path, "repack", "-a", "-d").CombinedOutput()
+	require.NoError(t, err, string(out))
+	// Reopen the repo so that go-git sees the new packfile.
+	repo = GoGitVCS{}.NewRepo(repo.Path).(*GoGitVCS)
+	t.Run("packed objects", func(t *testing.T) { check(t, repo) })
+}
+
 func readFile(t *testing.T, repo VCS, rev, path string) []byte {
-	f, err := repo.OpenFile(context.Background(), rev, path)
+	ctx := context.Background()
+	f, err := repo.OpenFile(ctx, rev, path)
 	require.NoError(t, err)
-	c, err := f.Content()
+	c, err := f.Content(ctx)
 	require.NoError(t, err)
 	defer c.Close()
 	bs, err := io.ReadAll(c)
@@ -54,14 +70,14 @@ func readFile(t *testing.T, repo VCS, rev, path string) []byte {
 
 func TestOpenFile(t *testing.T) {
 	small := []byte("<?xml version=\"1.0\"?>\n<model/>\n")
-	large := randomBytes(t, maxInMemoryFileSize+1)
+	large := randomBytes(t, bigFileThreshold+1)
 	repo := newTestRepo(t, map[string][]byte{
 		"model.config":     small,
 		"meshes/large.dae": large,
 	})
 	ctx := context.Background()
 
-	check := func(t *testing.T) {
+	forLooseAndPacked(t, repo, func(t *testing.T, repo *GoGitVCS) {
 		for _, r := range []VCS{repo, GitVCS{}.NewRepo(repo.Path)} {
 			assert.Equal(t, small, readFile(t, r, "", "model.config"))
 			assert.Equal(t, large, readFile(t, r, "tip", "meshes/large.dae"))
@@ -72,112 +88,76 @@ func TestOpenFile(t *testing.T) {
 			out, err := exec.Command("git", "-C", repo.Path, "rev-parse", "HEAD:meshes/large.dae").Output()
 			require.NoError(t, err)
 			assert.Equal(t, string(out[:len(out)-1]), f.Hash)
+			assert.Equal(t, int64(len(large)), f.Size)
 
-			for _, path := range []string{"meshes", ".", "missing.sdf", "meshes/missing.dae"} {
+			for _, path := range []string{"meshes", ".", "", "missing.sdf", "meshes/missing.dae",
+				"/model.config", "../model.config", "model.config\nHEAD:meshes/large.dae"} {
 				_, err = r.OpenFile(ctx, "", path)
 				assert.Error(t, err, path)
 			}
+			_, err = r.OpenFile(ctx, "missing-rev", "model.config")
+			assert.Error(t, err)
 		}
-	}
-
-	t.Run("loose objects", check)
-
-	out, err := exec.Command("git", "-C", repo.Path, "repack", "-a", "-d").CombinedOutput()
-	require.NoError(t, err, string(out))
-	// Reopen the repo so that go-git sees the new packfile.
-	repo = GoGitVCS{}.NewRepo(repo.Path).(*GoGitVCS)
-	t.Run("packed objects", check)
+	})
 }
 
 func TestOpenFileRevisions(t *testing.T) {
-	v1 := randomBytes(t, maxInMemoryFileSize+1)
+	// The versions are similar, so that packing stores one as a delta of the
+	// other.
+	v1 := randomBytes(t, bigFileThreshold+1)
+	v2 := append(append([]byte{}, v1...), []byte("v2")...)
+	v2[1000] ^= 0xff
 	repo := newTestRepo(t, map[string][]byte{"large.dae": v1, "model.sdf": []byte("v1")})
 	ctx := context.Background()
 
 	// ReplaceFiles commits with go-git, which writes loose objects.
-	v2 := randomBytes(t, maxInMemoryFileSize+2)
 	folder := t.TempDir()
 	writeFiles(t, folder, map[string][]byte{"large.dae": v2, "model.sdf": []byte("v2")})
 	require.NoError(t, repo.ReplaceFiles(ctx, folder, "owner"))
 
-	assert.Equal(t, v2, readFile(t, repo, "", "large.dae"))
-	assert.Equal(t, []byte("v2"), readFile(t, repo, "", "model.sdf"))
-	assert.Equal(t, v1, readFile(t, repo, "HEAD~1", "large.dae"))
-	assert.Equal(t, []byte("v1"), readFile(t, repo, "HEAD~1", "model.sdf"))
+	forLooseAndPacked(t, repo, func(t *testing.T, repo *GoGitVCS) {
+		assert.Equal(t, v2, readFile(t, repo, "", "large.dae"))
+		assert.Equal(t, []byte("v2"), readFile(t, repo, "", "model.sdf"))
+		assert.Equal(t, v1, readFile(t, repo, "HEAD~1", "large.dae"))
+		assert.Equal(t, []byte("v1"), readFile(t, repo, "HEAD~1", "model.sdf"))
+	})
 }
 
-func TestOpenFileCanceled(t *testing.T) {
-	repo := newTestRepo(t, map[string][]byte{"large.dae": randomBytes(t, 8*maxInMemoryFileSize)})
-	ctx, cancel := context.WithCancel(context.Background())
+func TestOpenFileUnreadable(t *testing.T) {
+	tmp := useTempDir(t)
+	data := randomBytes(t, 2*bigFileThreshold)
+	repo := newTestRepo(t, map[string][]byte{"large.dae": data})
+	ctx := context.Background()
 	f, err := repo.OpenFile(ctx, "", "large.dae")
 	require.NoError(t, err)
-	c, err := f.Content()
-	require.NoError(t, err)
-	defer c.Close()
+	objectPath := filepath.Join(repo.Path, ".git", "objects", f.Hash[:2], f.Hash[2:])
 
-	_, err = io.ReadFull(c, make([]byte, 1024))
+	// The object is replaced with a truncated one: its size can be read, but
+	// not its content.
+	var object bytes.Buffer
+	zw := zlib.NewWriter(&object)
+	_, err = fmt.Fprintf(zw, "blob %d\x00", len(data))
 	require.NoError(t, err)
-	// The request went away: git is killed, and reading fails.
-	cancel()
-	_, err = io.Copy(io.Discard, c)
-	assert.Error(t, err)
-}
-
-func TestOpenFileWaitsForGit(t *testing.T) {
-	data := randomBytes(t, 2*maxInMemoryFileSize)
-	repo := newTestRepo(t, map[string][]byte{"large.dae": data})
-	f, err := repo.OpenFile(context.Background(), "", "large.dae")
+	_, err = zw.Write(data[:100])
 	require.NoError(t, err)
-	c, err := f.Content()
+	require.NoError(t, zw.Close())
+	require.NoError(t, os.Remove(objectPath))
+	require.NoError(t, os.WriteFile(objectPath, object.Bytes(), 0444))
+	f, err = repo.OpenFile(ctx, "", "large.dae")
 	require.NoError(t, err)
-	git, ok := c.r.(*gitBlobReader)
-	require.True(t, ok, "the file is not read with git")
-
-	bs, err := io.ReadAll(c)
-	require.NoError(t, err)
-	assert.Equal(t, data, bs)
-	// Reading the content checked the git exit status.
-	require.NotNil(t, git.cmd.ProcessState)
-	assert.True(t, git.cmd.ProcessState.Success(), git.cmd.ProcessState.String())
-	require.NoError(t, c.Close())
-}
-
-func TestOpenFileGitFailsAtEnd(t *testing.T) {
-	data := randomBytes(t, 2*maxInMemoryFileSize)
-	repo := newTestRepo(t, map[string][]byte{"large.dae": data})
-	f, err := repo.OpenFile(context.Background(), "", "large.dae")
-	require.NoError(t, err)
-
-	// A git that writes the whole content, and then fails.
-	bin := t.TempDir()
-	content := filepath.Join(bin, "content")
-	require.NoError(t, os.WriteFile(content, data, 0644))
-	script := "#!/bin/sh\ncat " + content + "\necho failed >&2\nexit 1\n"
-	require.NoError(t, os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0755))
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	c, err := f.Content()
-	require.NoError(t, err)
-	defer c.Close()
-	bs, err := io.ReadAll(c)
+	assert.Equal(t, int64(len(data)), f.Size)
+	_, err = f.Content(ctx)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "exit status 1")
-	assert.Contains(t, err.Error(), "failed")
-	assert.Less(t, len(bs), len(data))
-}
 
-func TestOpenFileReadError(t *testing.T) {
-	repo := newTestRepo(t, map[string][]byte{"large.dae": randomBytes(t, 2*maxInMemoryFileSize)})
-	f, err := repo.OpenFile(context.Background(), "", "large.dae")
-	require.NoError(t, err)
 	// The object goes away after the file was opened.
-	require.NoError(t, os.Remove(filepath.Join(repo.Path, ".git", "objects", f.Hash[:2], f.Hash[2:])))
-	_, err = f.Content()
+	require.NoError(t, os.Remove(objectPath))
+	_, err = f.Content(ctx)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exit status")
+	assertEmptyDir(t, tmp)
 }
 
-func TestOpenFileClosesObjectFiles(t *testing.T) {
+func TestOpenFileClosesFiles(t *testing.T) {
 	if _, err := os.ReadDir("/proc/self/fd"); err != nil {
 		t.Skip("the open files cannot be counted")
 	}
@@ -186,25 +166,29 @@ func TestOpenFileClosesObjectFiles(t *testing.T) {
 		require.NoError(t, err)
 		return len(fds)
 	}
+	tmp := useTempDir(t)
 	repo := newTestRepo(t, map[string][]byte{"model.sdf": []byte("<sdf/>")})
 	// Files that are not closed are only closed by their finalizer.
 	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	ctx := context.Background()
 
-	check := func(t *testing.T) {
+	forLooseAndPacked(t, repo, func(t *testing.T, repo *GoGitVCS) {
 		before := countFDs()
 		for i := 0; i < 100; i++ {
-			_, err := repo.OpenFile(context.Background(), "", "model.sdf")
+			// A file whose content is not requested holds no files.
+			f, err := repo.OpenFile(ctx, "", "model.sdf")
 			require.NoError(t, err)
+			f, err = repo.OpenFile(ctx, "", "model.sdf")
+			require.NoError(t, err)
+			c, err := f.Content(ctx)
+			require.NoError(t, err)
+			require.NoError(t, c.Close())
+			_, err = repo.OpenFile(ctx, "", "missing.sdf")
+			require.Error(t, err)
 		}
 		assert.Less(t, countFDs()-before, 10)
-	}
-
-	t.Run("loose objects", check)
-
-	out, err := exec.Command("git", "-C", repo.Path, "repack", "-a", "-d").CombinedOutput()
-	require.NoError(t, err, string(out))
-	repo = GoGitVCS{}.NewRepo(repo.Path).(*GoGitVCS)
-	t.Run("packed objects", check)
+		assertEmptyDir(t, tmp)
+	})
 }
 
 // totalAlloc returns the bytes allocated while running fn.
@@ -217,29 +201,33 @@ func totalAlloc(fn func()) uint64 {
 	return after.TotalAlloc - before.TotalAlloc
 }
 
+// TestLargeFileIsNotLoadedInMemory checks the memory allocated by this
+// process. Note that it does not include the memory used by git.
 func TestLargeFileIsNotLoadedInMemory(t *testing.T) {
 	const size = 32 << 20
 	repo := newTestRepo(t, map[string][]byte{"large.dae": randomBytes(t, size)})
 	ctx := context.Background()
 
-	alloc := totalAlloc(func() {
-		f, err := repo.OpenFile(ctx, "", "large.dae")
-		require.NoError(t, err)
-		c, err := f.Content()
-		require.NoError(t, err)
-		defer c.Close()
-		n, err := io.Copy(io.Discard, c)
-		require.NoError(t, err)
-		require.Equal(t, int64(size), n)
-	})
-	assert.Less(t, alloc, uint64(size/8), "OpenFile allocated %d bytes", alloc)
+	forLooseAndPacked(t, repo, func(t *testing.T, repo *GoGitVCS) {
+		alloc := totalAlloc(func() {
+			f, err := repo.OpenFile(ctx, "", "large.dae")
+			require.NoError(t, err)
+			c, err := f.Content(ctx)
+			require.NoError(t, err)
+			defer c.Close()
+			n, err := io.Copy(io.Discard, c)
+			require.NoError(t, err)
+			require.Equal(t, int64(size), n)
+		})
+		assert.Less(t, alloc, uint64(size/8), "OpenFile allocated %d bytes", alloc)
 
-	alloc = totalAlloc(func() {
-		require.NoError(t, repo.Walk(ctx, "", true, func(path, parent string, isDir bool) error {
-			return nil
-		}))
+		alloc = totalAlloc(func() {
+			require.NoError(t, repo.Walk(ctx, "", true, func(path, parent string, isDir bool) error {
+				return nil
+			}))
+		})
+		assert.Less(t, alloc, uint64(size/8), "Walk allocated %d bytes", alloc)
 	})
-	assert.Less(t, alloc, uint64(size/8), "Walk allocated %d bytes", alloc)
 }
 
 func TestWalk(t *testing.T) {

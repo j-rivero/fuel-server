@@ -15,7 +15,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path"
@@ -624,10 +628,34 @@ func TestGetIndividualLargeFile(t *testing.T) {
 	resp = gztest.AssertRouteMultipleArgsStruct(reqArgs, http.StatusPartialContent, "text/plain; charset=utf-8", t)
 	assert.Equal(t, contents[1048576:1048592], string(*resp.BodyAsBytes))
 
-	// Multi-range requests get the whole file.
-	reqArgs.Headers = map[string]string{"Range": "bytes=1048576-1048591,0-15"}
-	resp = gztest.AssertRouteMultipleArgsStruct(reqArgs, http.StatusOK, "text/plain; charset=utf-8", t)
-	assert.Equal(t, contents, string(*resp.BodyAsBytes))
+	// Multi-range requests get each range, in their order.
+	req, err := http.NewRequest("GET", uri, nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Range", "bytes=1048576-1048591,0-15")
+	respRec := httptest.NewRecorder()
+	globals.Server.Router.ServeHTTP(respRec, req)
+	require.Equal(t, http.StatusPartialContent, respRec.Code)
+	ensureIgnResourceVersionHeader(respRec, 1, t)
+	assert.Equal(t, "attachment; filename=\"large.txt\"", respRec.Header().Get("Content-Disposition"))
+	mediaType, params, err := mime.ParseMediaType(respRec.Header().Get("Content-Type"))
+	require.NoError(t, err)
+	require.Equal(t, "multipart/byteranges", mediaType)
+	mr := multipart.NewReader(respRec.Body, params["boundary"])
+	for _, want := range []struct{ rng, body string }{
+		{"bytes 1048576-1048591/" + strconv.Itoa(len(contents)), contents[1048576:1048592]},
+		{"bytes 0-15/" + strconv.Itoa(len(contents)), contents[:16]},
+	} {
+		part, err := mr.NextPart()
+		require.NoError(t, err)
+		assert.Equal(t, want.rng, part.Header.Get("Content-Range"))
+		assert.Equal(t, "text/plain; charset=utf-8", part.Header.Get("Content-Type"))
+		body, err := io.ReadAll(part)
+		require.NoError(t, err)
+		assert.Equal(t, want.body, string(body))
+	}
+	_, err = mr.NextPart()
+	assert.Equal(t, io.EOF, err)
 
 	// Replace the file object with a truncated one: its size can be read, but
 	// not its content.

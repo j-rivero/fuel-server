@@ -253,6 +253,17 @@ Then load the env vars using `source .env.bash` from the bash terminal where you
    Note: This env var will be used by the backend to decode and validate any received Auth0 JWT tokens. You can get this
    key from: <https://osrfoundation.auth0.com/.well-known/jwks.json> (or from your auth0 user). It is the "x5c" field.
 
+## Temporary files
+
+Individual file downloads extract the requested file version from its git
+repository into a temporary file, which is removed when the response ends.
+They are created in `TMPDIR` (`/tmp` if unset), which needs room for the files
+being downloaded at the same time. It should be disk-backed: on a `tmpfs`, the
+downloaded files are held in memory. The number of files extracted at the same
+time is limited to the number of CPUs (`GOMAXPROCS`); further downloads wait.
+Note that git may still load a file in memory while extracting it, eg. when it
+is stored as a delta in a packfile.
+
 ## Using AWS S3 buckets
 
 1. AWS_BUCKET_PREFIX: set it to a prefix that will be shared by all buckets

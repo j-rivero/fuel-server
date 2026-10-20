@@ -13,7 +13,6 @@ import (
 	"github.com/jinzhu/gorm"
 	"net/http"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -39,12 +38,6 @@ func IndividualFileDownload(s getFileService, owner, name string, jwtUser *users
 
 	// Remove request header to always serve fresh
 	r.Header.Del("If-Modified-Since")
-	// The file content is read while it is sent, and each range of a multi-range
-	// request that starts before the previous one reads the file again from its
-	// beginning. Serve the whole file instead, as RFC 7233 allows.
-	if strings.Contains(r.Header.Get("Range"), ",") {
-		r.Header.Del("Range")
-	}
 	// Also tag it as "attachment" to force a file download
 	filename := filepath.Base(cleanPath)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
@@ -56,9 +49,9 @@ func IndividualFileDownload(s getFileService, owner, name string, jwtUser *users
 
 	writeIgnResourceVersionHeader(w, ver)
 
-	// The content is read from the repository while it is sent, so that large
-	// files are not loaded in memory.
-	content, err := f.Content()
+	// The content is extracted from the repository to a temporary file, so that
+	// large files are not loaded in memory.
+	content, err := f.Content(r.Context())
 	if err != nil {
 		if r.Context().Err() == nil {
 			gz.LoggerFromContext(r.Context()).Error(fmt.Sprintf("Error while reading file %s of %s/%s",
@@ -71,11 +64,5 @@ func IndividualFileDownload(s getFileService, owner, name string, jwtUser *users
 	modtime := time.Now()
 	// Note: ServeContent should be called after all headers were set.
 	http.ServeContent(w, r, filename, modtime, content)
-	// A read error after the response started is not reported to the client,
-	// other than by a response shorter than its Content-Length.
-	if err := content.Err(); err != nil && r.Context().Err() == nil {
-		gz.LoggerFromContext(r.Context()).Error(fmt.Sprintf("Error while sending file %s of %s/%s",
-			cleanPath, owner, name), err)
-	}
 	return nil, nil
 }

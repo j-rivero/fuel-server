@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"github.com/gazebo-web/gz-go/v7"
 	"github.com/pkg/errors"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,38 +102,7 @@ func (g *GitVCS) Init(ctx context.Context) error {
 // content is not read until requested.
 func (g *GitVCS) OpenFile(ctx context.Context, rev string, pathFromRoot string) (*File, error) {
 	gz.LoggerFromContext(ctx).Info("WARNING: ideally, we should not use the plain GitVCS implementation. Try to use GoGitVCS")
-	if err := ensureFolderExists(g.Path); err != nil {
-		return nil, err
-	}
-	// git cat-file --batch-check reads one object name per line.
-	if strings.Contains(pathFromRoot, "\n") {
-		return nil, errors.New("Invalid file path: " + pathFromRoot)
-	}
-	rev = ensureRev(rev)
-	cmd := exec.Command("git", "-C", g.Path, "cat-file", "--batch-check")
-	cmd.Stdin = strings.NewReader(rev + ":" + pathFromRoot + "\n")
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	bs, err := cmd.Output()
-	if err != nil {
-		err = gz.WithStack(err)
-		gz.LoggerFromContext(ctx).Info("Error while running process. Err: " + fmt.Sprint(err) + ". Stderr: " + stderr.String())
-		return nil, err
-	}
-	// The output is "<hash> <type> <size>", or "<object> missing".
-	fields := strings.Fields(string(bs))
-	if len(fields) != 3 || fields[1] != "blob" {
-		return nil, errors.New("File not found: " + pathFromRoot)
-	}
-	size, err := strconv.ParseInt(fields[2], 10, 64)
-	if err != nil {
-		return nil, gz.WithStack(err)
-	}
-	hash := fields[0]
-	open := func() (io.ReadCloser, error) {
-		return catBlob(ctx, g.Path, hash)
-	}
-	return &File{Hash: hash, Size: size, open: open}, nil
+	return openFile(ctx, g.Path, rev, pathFromRoot)
 }
 
 // Walk - given a revision, Walk func iterates over the repository and invokes the

@@ -2,52 +2,62 @@ package vcs
 
 import (
 	"bytes"
-	"errors"
+	"context"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
-	"testing/iotest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// newBytesFile returns a File with the given content, and a counter of the
-// times it was opened.
-func newBytesFile(content []byte, size int64) (*File, *int) {
-	opens := 0
-	f := &File{Hash: "hash", Size: size, open: func() (io.ReadCloser, error) {
-		opens++
-		return io.NopCloser(bytes.NewReader(content)), nil
-	}}
-	return f, &opens
+// useTempDir makes the temporary files be created in a new folder, which is
+// returned.
+func useTempDir(t *testing.T) string {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	return dir
+}
+
+// assertEmptyDir asserts that dir has no files.
+func assertEmptyDir(t *testing.T, dir string) {
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+// useFakeGit makes the git command run the given shell script.
+func useFakeGit(t *testing.T, script string) {
+	bin := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n"+script), 0755))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// openTestFile returns the file with the given content, stored in a new
+// repository.
+func openTestFile(t *testing.T, data []byte) *File {
+	repo := newTestRepo(t, map[string][]byte{"file": data})
+	f, err := repo.OpenFile(context.Background(), "", "file")
+	require.NoError(t, err)
+	return f
 }
 
 func TestFileContentReadSeek(t *testing.T) {
+	tmp := useTempDir(t)
 	data := bytes.Repeat([]byte("0123456789"), 100)
-	f, opens := newBytesFile(data, int64(len(data)))
-	c, err := f.Content()
+	c, err := openTestFile(t, data).Content(context.Background())
 	require.NoError(t, err)
-	defer c.Close()
-	assert.Equal(t, 1, *opens)
-
-	// Seeking does not open the file.
-	size, err := c.Seek(0, io.SeekEnd)
-	require.NoError(t, err)
-	assert.Equal(t, int64(len(data)), size)
-	_, err = c.Seek(0, io.SeekStart)
-	require.NoError(t, err)
-	assert.Equal(t, 1, *opens)
 
 	bs, err := io.ReadAll(c)
 	require.NoError(t, err)
 	assert.Equal(t, data, bs)
-	assert.Equal(t, 1, *opens)
 
-	// Seeking backwards opens the file again.
 	pos, err := c.Seek(-10, io.SeekEnd)
 	require.NoError(t, err)
 	assert.Equal(t, int64(990), pos)
@@ -55,206 +65,172 @@ func TestFileContentReadSeek(t *testing.T) {
 	_, err = io.ReadFull(c, buf)
 	require.NoError(t, err)
 	assert.Equal(t, "01234", string(buf))
-	assert.Equal(t, 2, *opens)
 
-	// Seeking forward skips content.
-	pos, err = c.Seek(3, io.SeekCurrent)
-	require.NoError(t, err)
-	assert.Equal(t, int64(998), pos)
-	bs, err = io.ReadAll(c)
-	require.NoError(t, err)
-	assert.Equal(t, "89", string(bs))
-	assert.Equal(t, 2, *opens)
-
-	// The beginning of the content is kept in memory.
-	_, err = c.Seek(headSize-10, io.SeekStart)
+	_, err = c.Seek(3, io.SeekStart)
 	require.NoError(t, err)
 	_, err = io.ReadFull(c, buf)
 	require.NoError(t, err)
-	assert.Equal(t, data[headSize-10:headSize-5], buf)
-	assert.Equal(t, 2, *opens)
+	assert.Equal(t, "34567", string(buf))
 
-	// Reading past the end.
-	_, err = c.Seek(2000, io.SeekStart)
-	require.NoError(t, err)
-	n, err := c.Read(buf)
-	assert.Equal(t, 0, n)
-	assert.Equal(t, io.EOF, err)
-
-	_, err = c.Seek(-1, io.SeekStart)
-	assert.Error(t, err)
-	_, err = c.Seek(0, 42)
-	assert.Error(t, err)
-
-	assert.NoError(t, c.Close())
-	assert.NoError(t, c.Close())
-}
-
-func TestFileContentReadAfterClose(t *testing.T) {
-	data := bytes.Repeat([]byte("0123456789"), 100)
-	f, opens := newBytesFile(data, int64(len(data)))
-	c, err := f.Content()
-	require.NoError(t, err)
-	_, err = c.Seek(headSize+10, io.SeekStart)
-	require.NoError(t, err)
-	_, err = c.Read(make([]byte, 10))
-	require.NoError(t, err)
 	require.NoError(t, c.Close())
-
-	// Reading does not open the file again, including after the beginning
-	// of the content.
-	for _, off := range []int64{0, headSize + 20} {
-		_, err = c.Seek(off, io.SeekStart)
-		require.NoError(t, err)
-		n, err := c.Read(make([]byte, 10))
-		assert.Equal(t, 0, n)
-		assert.ErrorIs(t, err, os.ErrClosed)
-	}
-	assert.Equal(t, 1, *opens)
-	assert.NoError(t, c.Close())
+	_, err = c.Read(buf)
+	assert.ErrorIs(t, err, os.ErrClosed)
+	assertEmptyDir(t, tmp)
 }
 
 func TestFileContentEmpty(t *testing.T) {
-	f, opens := newBytesFile(nil, 0)
-	c, err := f.Content()
+	c, err := openTestFile(t, nil).Content(context.Background())
 	require.NoError(t, err)
 	defer c.Close()
 	bs, err := io.ReadAll(c)
 	require.NoError(t, err)
 	assert.Empty(t, bs)
-	assert.Equal(t, 0, *opens)
-}
-
-func TestFileContentOpenError(t *testing.T) {
-	errOpen := errors.New("open failed")
-	f := &File{Hash: "hash", Size: 10, open: func() (io.ReadCloser, error) {
-		return nil, errOpen
-	}}
-	_, err := f.Content()
-	assert.Equal(t, errOpen, err)
-}
-
-func TestFileContentReadError(t *testing.T) {
-	data := bytes.Repeat([]byte("0123456789"), 100)
-	errRead := errors.New("read failed")
-	opens := 0
-	f := &File{Hash: "hash", Size: int64(len(data)), open: func() (io.ReadCloser, error) {
-		opens++
-		return io.NopCloser(io.MultiReader(bytes.NewReader(data[:600]), iotest.ErrReader(errRead))), nil
-	}}
-	c, err := f.Content()
-	require.NoError(t, err)
-	defer c.Close()
-	assert.NoError(t, c.Err())
-
-	bs, err := io.ReadAll(c)
-	assert.Equal(t, errRead, err)
-	assert.Equal(t, data[:600], bs)
-	assert.Equal(t, errRead, c.Err())
-
-	// The error is kept, and the file is not opened again.
-	_, err = c.Seek(0, io.SeekStart)
-	require.NoError(t, err)
-	_, err = c.Read(make([]byte, 10))
-	assert.Equal(t, errRead, err)
-	assert.Equal(t, 1, opens)
-}
-
-func TestFileContentShortStream(t *testing.T) {
-	data := []byte("0123456789")
-	// The content is shorter than the file size.
-	f, _ := newBytesFile(data, int64(len(data))+5)
-	_, err := f.Content()
-	assert.Equal(t, io.ErrUnexpectedEOF, err)
-
-	// Same, after the beginning of the content.
-	data = bytes.Repeat(data, 100)
-	f, _ = newBytesFile(data, int64(len(data))+5)
-	c, err := f.Content()
-	require.NoError(t, err)
-	defer c.Close()
-	_, err = io.ReadAll(c)
-	assert.Equal(t, io.ErrUnexpectedEOF, err)
-	assert.Equal(t, io.ErrUnexpectedEOF, c.Err())
-
-	// Same, when skipping content.
-	c, err = f.Content()
-	require.NoError(t, err)
-	defer c.Close()
-	_, err = c.Seek(int64(len(data))+2, io.SeekStart)
-	require.NoError(t, err)
-	_, err = c.Read(make([]byte, 1))
-	assert.Equal(t, io.ErrUnexpectedEOF, err)
-}
-
-func TestFileContentLongStream(t *testing.T) {
-	data := []byte("0123456789")
-	// The content is longer than the file size.
-	f, _ := newBytesFile(data, int64(len(data))-1)
-	_, err := f.Content()
-	assert.Error(t, err)
-
-	// Same, after the beginning of the content.
-	data = bytes.Repeat(data, 100)
-	f, _ = newBytesFile(data, int64(len(data))-1)
-	c, err := f.Content()
-	require.NoError(t, err)
-	defer c.Close()
-	bs, err := io.ReadAll(c)
-	assert.Error(t, err)
-	assert.Less(t, len(bs), len(data)-1)
-}
-
-func TestFileContentErrorAtEnd(t *testing.T) {
-	// The reader fails after returning the whole content, eg. git exits with
-	// an error status.
-	data := bytes.Repeat([]byte("0123456789"), 100)
-	errRead := errors.New("read failed")
-	f := &File{Hash: "hash", Size: int64(len(data)), open: func() (io.ReadCloser, error) {
-		return io.NopCloser(io.MultiReader(bytes.NewReader(data), iotest.ErrReader(errRead))), nil
-	}}
-	c, err := f.Content()
-	require.NoError(t, err)
-	defer c.Close()
-	bs, err := io.ReadAll(c)
-	assert.Equal(t, errRead, err)
-	assert.Less(t, len(bs), len(data))
 }
 
 func TestFileContentServeContent(t *testing.T) {
 	data := bytes.Repeat([]byte("0123456789"), 100)
-	f, opens := newBytesFile(data, int64(len(data)))
+	f := openTestFile(t, data)
 
-	// serve serves the file, and returns the response and the times the file
-	// was opened. The file name has no extension, so that ServeContent reads
-	// the content to detect its type.
-	serve := func(rangeHeader string) (*httptest.ResponseRecorder, int) {
+	// serve serves the file. The file name has no extension, so that
+	// ServeContent reads the content to detect its type.
+	serve := func(rangeHeader string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest("GET", "/file", nil)
 		if rangeHeader != "" {
 			r.Header.Set("Range", rangeHeader)
 		}
 		w := httptest.NewRecorder()
-		before := *opens
-		c, err := f.Content()
+		c, err := f.Content(context.Background())
 		require.NoError(t, err)
 		defer c.Close()
 		http.ServeContent(w, r, "file", time.Now(), c)
-		return w, *opens - before
+		return w
 	}
 
-	w, n := serve("")
+	w := serve("")
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "1000", w.Header().Get("Content-Length"))
+	assert.Equal(t, "text/plain; charset=utf-8", w.Header().Get("Content-Type"))
 	assert.Equal(t, data, w.Body.Bytes())
-	assert.Equal(t, 1, n)
 
-	w, n = serve("bytes=995-")
+	w = serve("bytes=995-")
 	assert.Equal(t, http.StatusPartialContent, w.Code)
+	assert.Equal(t, "bytes 995-999/1000", w.Header().Get("Content-Range"))
 	assert.Equal(t, "56789", w.Body.String())
-	assert.Equal(t, 1, n)
 
-	w, _ = serve("bytes=10-14,2-3")
+	// The ranges of a multi-range request are sent in their order, even when
+	// they go backwards.
+	w = serve("bytes=10-14,2-3")
 	assert.Equal(t, http.StatusPartialContent, w.Code)
-	assert.Contains(t, w.Body.String(), "\r\n\r\n01234\r\n")
-	assert.Contains(t, w.Body.String(), "\r\n\r\n23\r\n")
+	assert.Equal(t, []string{"01234", "23"}, readMultipart(t, w, "text/plain; charset=utf-8"))
+}
+
+// readMultipart returns the parts of a multipart/byteranges response, and
+// checks their content type.
+func readMultipart(t *testing.T, w *httptest.ResponseRecorder, contentType string) []string {
+	mediaType, params, err := mime.ParseMediaType(w.Header().Get("Content-Type"))
+	require.NoError(t, err)
+	require.Equal(t, "multipart/byteranges", mediaType)
+	mr := multipart.NewReader(w.Body, params["boundary"])
+	var parts []string
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			return parts
+		}
+		require.NoError(t, err)
+		assert.Equal(t, contentType, p.Header.Get("Content-Type"))
+		bs, err := io.ReadAll(p)
+		require.NoError(t, err)
+		parts = append(parts, string(bs))
+	}
+}
+
+func TestFileContentSizeMismatch(t *testing.T) {
+	tmp := useTempDir(t)
+	data := bytes.Repeat([]byte("0123456789"), 100)
+	f := openTestFile(t, data)
+
+	// git outputs less or more than the file size, and succeeds.
+	for _, script := range []string{"head -c 999 " + "$CONTENT\n", "cat $CONTENT; echo extra\n"} {
+		content := filepath.Join(t.TempDir(), "content")
+		require.NoError(t, os.WriteFile(content, data, 0644))
+		t.Setenv("CONTENT", content)
+		useFakeGit(t, script)
+		_, err := f.Content(context.Background())
+		require.Error(t, err, script)
+		assert.Contains(t, err.Error(), "expected 1000", script)
+	}
+	assertEmptyDir(t, tmp)
+}
+
+func TestFileContentGitFails(t *testing.T) {
+	tmp := useTempDir(t)
+	data := bytes.Repeat([]byte("0123456789"), 100)
+	f := openTestFile(t, data)
+
+	// git outputs the whole content, and then fails.
+	content := filepath.Join(t.TempDir(), "content")
+	require.NoError(t, os.WriteFile(content, data, 0644))
+	useFakeGit(t, "cat "+content+"\necho failed >&2\nexit 1\n")
+
+	_, err := f.Content(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exit status 1")
+	assert.Contains(t, err.Error(), "failed")
+	assertEmptyDir(t, tmp)
+}
+
+func TestFileContentCanceled(t *testing.T) {
+	tmp := useTempDir(t)
+	f := openTestFile(t, []byte("content"))
+	// A git that does not end.
+	useFakeGit(t, "echo partial\nexec sleep 60\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	_, err := f.Content(ctx)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Less(t, time.Since(start), 30*time.Second)
+	assertEmptyDir(t, tmp)
+
+	// The context is done before the extraction starts.
+	_, err = f.Content(ctx)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestFileContentWaitsForExtractions(t *testing.T) {
+	f := openTestFile(t, []byte("content"))
+	// Take all the extraction slots.
+	for i := 0; i < cap(extractions); i++ {
+		extractions <- struct{}{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := f.Content(ctx)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// Once a slot is free, the extraction runs.
+	<-extractions
+	c, err := f.Content(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+	for i := 1; i < cap(extractions); i++ {
+		<-extractions
+	}
+	assert.Empty(t, extractions)
+}
+
+func TestTempFileRemovedOnClose(t *testing.T) {
+	tmp := useTempDir(t)
+	tf, err := newTempFile()
+	require.NoError(t, err)
+	// The file is removed right away where possible, and otherwise on close.
+	path := filepath.Join(tmp, filepath.Base(tf.File.Name()))
+	_, err = tf.Write([]byte("data"))
+	require.NoError(t, err)
+	require.NoError(t, tf.Close())
+	_, err = os.Stat(path)
+	assert.True(t, os.IsNotExist(err))
+	assertEmptyDir(t, tmp)
 }
